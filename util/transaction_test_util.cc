@@ -59,6 +59,36 @@ bool RandomTransactionInserter::TransactionDBInsert(
   return res;
 }
 
+bool RandomTransactionInserter::TransactionDBXAInsert(
+    TransactionDB* db, const TransactionOptions& txn_options) {
+  txn_ = db->BeginTransaction(write_options_, txn_options, txn_);
+  bool take_snapshot = rand_->OneIn(2);
+  if (take_snapshot) {
+    txn_->SetSnapshot();
+    read_options_.snapshot = txn_->GetSnapshot();
+  }
+  auto res = DoInsert(nullptr, txn_, false,1);
+  if (take_snapshot) {
+    read_options_.snapshot = nullptr;
+  }
+  return res;
+}
+bool RandomTransactionInserter::TransactionDBNoPrepareInsert(
+    TransactionDB* db, const TransactionOptions& txn_options) {
+  txn_ = db->BeginTransaction(write_options_, txn_options, txn_);
+  bool take_snapshot = rand_->OneIn(2);
+  if (take_snapshot) {
+    txn_->SetSnapshot();
+    read_options_.snapshot = txn_->GetSnapshot();
+  }
+  auto res = DoInsert(nullptr, txn_, false, -1);
+  if (take_snapshot) {
+    read_options_.snapshot = nullptr;
+  }
+  return res;
+}
+
+
 bool RandomTransactionInserter::OptimisticTransactionDBInsert(
     OptimisticTransactionDB* db,
     const OptimisticTransactionOptions& txn_options) {
@@ -117,7 +147,7 @@ Status RandomTransactionInserter::DBGet(
 }
 
 bool RandomTransactionInserter::DoInsert(DB* db, Transaction* txn,
-                                         bool is_optimistic) {
+                                         bool is_optimistic,int always_prepare) {
   Status s;
   WriteBatch batch;
 
@@ -178,7 +208,7 @@ bool RandomTransactionInserter::DoInsert(DB* db, Transaction* txn,
       snprintf(name, 64, "txn%" ROCKSDB_PRIszt "-%d", hasher(std::this_thread::get_id()),
                txn_id_++);
       assert(strlen(name) < 64 - 1);
-      if (!is_optimistic && !rand_->OneIn(10)) {
+      if (!is_optimistic && always_prepare != -1 && (!rand_->OneIn(10)||always_prepare==1)) {
         // also try commit without prpare
         txn->SetName(name);
         s = txn->Prepare();

@@ -51,6 +51,12 @@ class RandomTransactionInserter {
       TransactionDB* db,
       const TransactionOptions& txn_options = TransactionOptions());
 
+    bool TransactionDBXAInsert(
+      TransactionDB* db,
+      const TransactionOptions& txn_options = TransactionOptions());
+  bool TransactionDBNoPrepareInsert(
+      TransactionDB* db,
+      const TransactionOptions& txn_options = TransactionOptions());
   // Increment a key in each set using a Transaction on an
   // OptimisticTransactionDB
   //
@@ -118,7 +124,7 @@ class RandomTransactionInserter {
 
   std::atomic<int> txn_id_;
 
-  bool DoInsert(DB* db, Transaction* txn, bool is_optimistic);
+  bool DoInsert(DB* db, Transaction* txn, bool is_optimistic, int always_prepare=0);
 };
 
 }  // namespace rocksdb

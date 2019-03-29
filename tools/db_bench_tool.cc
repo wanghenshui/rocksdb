@@ -246,6 +246,10 @@ DEFINE_bool(reverse_iterator, false,
             "When true use Prev rather than Next for iterators that do "
             "Seek and then Next");
 
+DEFINE_int32(transaction_db_xa, false,
+            "transaction_db_xa prepare flag, default false");
+
+
 DEFINE_bool(use_uint64_comparator, false, "use Uint64 user comparator");
 
 DEFINE_int64(batch_size, 1, "Batch size");
@@ -3295,7 +3299,6 @@ void VerifyDBFromDB(std::string& truth_db_name) {
       exit(1);
     }
 #endif  // ROCKSDB_LITE
-
   }
 
   void InitializeOptionsGeneral(Options* opts) {
@@ -3421,6 +3424,9 @@ void VerifyDBFromDB(std::string& truth_db_name) {
       } else if (FLAGS_transaction_db) {
         TransactionDB* ptr;
         TransactionDBOptions txn_db_options;
+        if (FLAGS_transaction_db_xa==1) {
+          options.allow_2pc = true;
+        }
         s = TransactionDB::Open(options, txn_db_options, db_name,
                                 column_families, &db->cfh, &ptr);
         if (s.ok()) {
@@ -3444,7 +3450,7 @@ void VerifyDBFromDB(std::string& truth_db_name) {
       if (s.ok()) {
         db->db = db->opt_txn_db->GetBaseDB();
       }
-    } else if (FLAGS_transaction_db) {
+    } else if (FLAGS_transaction_db || FLAGS_transaction_db_xa) {
       TransactionDB* ptr = nullptr;
       TransactionDBOptions txn_db_options;
       s = CreateLoggerFromOptions(db_name, options, &options.info_log);
@@ -5056,7 +5062,14 @@ void VerifyDBFromDB(std::string& truth_db_name) {
       } else if (FLAGS_transaction_db) {
         TransactionDB* txn_db = reinterpret_cast<TransactionDB*>(db_.db);
         success = inserter.TransactionDBInsert(txn_db, txn_options);
-      } else {
+      } else if (FLAGS_transaction_db_xa==1) {
+        TransactionDB* txn_db = reinterpret_cast<TransactionDB*>(db_.db);
+        success = inserter.TransactionDBXAInsert(txn_db, txn_options);
+      }else if (FLAGS_transaction_db_xa == -1) {
+		TransactionDB* txn_db = reinterpret_cast<TransactionDB*>(db_.db);
+		success = inserter.TransactionDBNoPrepareInsert(txn_db, txn_options);
+		}
+	  else {
         success = inserter.DBInsert(db_.db);
       }
 
@@ -5071,7 +5084,8 @@ void VerifyDBFromDB(std::string& truth_db_name) {
     }
 
     char msg[100];
-    if (FLAGS_optimistic_transaction_db || FLAGS_transaction_db) {
+    if (FLAGS_optimistic_transaction_db || FLAGS_transaction_db ||
+        FLAGS_transaction_db_xa) {
       snprintf(msg, sizeof(msg),
                "( transactions:%" PRIu64 " aborts:%" PRIu64 ")",
                transactions_done, inserter.GetFailureCount());
@@ -5090,7 +5104,8 @@ void VerifyDBFromDB(std::string& truth_db_name) {
   // Since each iteration of RandomTransaction() incremented a key in each set
   // by the same value, the sum of the keys in each set should be the same.
   void RandomTransactionVerify() {
-    if (!FLAGS_transaction_db && !FLAGS_optimistic_transaction_db) {
+    if (!FLAGS_transaction_db && !FLAGS_optimistic_transaction_db &&
+        !FLAGS_transaction_db_xa) {
       // transactions not used, nothing to verify.
       return;
     }
