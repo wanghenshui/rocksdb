@@ -220,13 +220,14 @@ TableBuilder* BlockBasedTableFactory::NewTableBuilder(
       table_builder_options.column_family_name,
       table_builder_options.creation_time,
       table_builder_options.oldest_key_time,
-      table_builder_options.target_file_size);
+      table_builder_options.target_file_size,
+      table_builder_options.file_creation_time);
 
   return table_builder;
 }
 
 Status BlockBasedTableFactory::SanitizeOptions(
-    const DBOptions& /*db_opts*/, const ColumnFamilyOptions& cf_opts) const {
+    const DBOptions& db_opts, const ColumnFamilyOptions& cf_opts) const {
   if (table_options_.index_type == BlockBasedTableOptions::kHashSearch &&
       cf_opts.prefix_extractor == nullptr) {
     return Status::InvalidArgument(
@@ -267,6 +268,12 @@ Status BlockBasedTableFactory::SanitizeOptions(
         "data_block_hash_table_util_ratio should be greater than 0 when "
         "data_block_index_type is set to kDataBlockBinaryAndHash");
   }
+  if (db_opts.unordered_write && cf_opts.max_successive_merges > 0) {
+    // TODO(myabandeh): support it
+    return Status::InvalidArgument(
+        "max_successive_merges larger than 0 is currently inconsistent with "
+        "unordered_write");
+  }
   return Status::OK();
 }
 
@@ -299,6 +306,9 @@ std::string BlockBasedTableFactory::GetPrintableTableOptions() const {
   ret.append(buffer);
   snprintf(buffer, kBufferSize, "  data_block_index_type: %d\n",
            table_options_.data_block_index_type);
+  ret.append(buffer);
+  snprintf(buffer, kBufferSize, "  index_shortening: %d\n",
+           static_cast<int>(table_options_.index_shortening));
   ret.append(buffer);
   snprintf(buffer, kBufferSize, "  data_block_hash_table_util_ratio: %lf\n",
            table_options_.data_block_hash_table_util_ratio);

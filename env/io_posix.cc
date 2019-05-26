@@ -37,7 +37,7 @@
 
 #if defined(OS_LINUX) && !defined(F_SET_RW_HINT)
 #define F_LINUX_SPECIFIC_BASE 1024
-#define F_SET_RW_HINT         (F_LINUX_SPECIFIC_BASE + 12)
+#define F_SET_RW_HINT (F_LINUX_SPECIFIC_BASE + 12)
 #endif
 
 namespace rocksdb {
@@ -57,6 +57,58 @@ int Fadvise(int fd, off_t offset, size_t len, int advice) {
 }
 
 namespace {
+
+// On MacOS (and probably *BSD), the posix write and pwrite calls do not support
+// buffers larger than 2^31-1 bytes. These two wrappers fix this issue by
+// cutting the buffer in 1GB chunks. We use this chunk size to be sure to keep
+// the writes aligned.
+
+bool PosixWrite(int fd, const char* buf, size_t nbyte) {
+  const size_t kLimit1Gb = 1UL << 30;
+
+  const char* src = buf;
+  size_t left = nbyte;
+
+  while (left != 0) {
+    size_t bytes_to_write = std::min(left, kLimit1Gb);
+
+    ssize_t done = write(fd, src, bytes_to_write);
+    if (done < 0) {
+      if (errno == EINTR) {
+        continue;
+      }
+      return false;
+    }
+    left -= done;
+    src += done;
+  }
+  return true;
+}
+
+bool PosixPositionedWrite(int fd, const char* buf, size_t nbyte, off_t offset) {
+  const size_t kLimit1Gb = 1UL << 30;
+
+  const char* src = buf;
+  size_t left = nbyte;
+
+  while (left != 0) {
+    size_t bytes_to_write = std::min(left, kLimit1Gb);
+
+    ssize_t done = pwrite(fd, src, bytes_to_write, offset);
+    if (done < 0) {
+      if (errno == EINTR) {
+        continue;
+      }
+      return false;
+    }
+    left -= done;
+    offset += done;
+    src += done;
+  }
+
+  return true;
+}
+
 size_t GetLogicalBufferSize(int __attribute__((__unused__)) fd) {
 #ifdef OS_LINUX
   struct stat buf;
@@ -125,7 +177,45 @@ size_t GetLogicalBufferSize(int __attribute__((__unused__)) fd) {
 #endif
   return kDefaultPageSize;
 }
-} //  namespace
+
+#ifdef ROCKSDB_RANGESYNC_PRESENT
+
+#if !defined(ZFS_SUPER_MAGIC)
+// The magic number for ZFS was not exposed until recently. It should be fixed
+// forever so we can just copy the magic number here.
+#define ZFS_SUPER_MAGIC 0x2fc12fc1
+#endif
+
+bool IsSyncFileRangeSupported(int __attribute__((__unused__)) fd) {
+  // `fstatfs` is only available on Linux, but so is `sync_file_range`, so
+  // `defined(ROCKSDB_RANGESYNC_PRESENT)` should imply `defined(OS_LINUX)`.
+  struct statfs buf;
+  int ret = fstatfs(fd, &buf);
+  assert(ret == 0);
+  if (ret != 0) {
+    // We don't know whether the filesystem properly supports `sync_file_range`.
+    // Even if it doesn't, we don't know of any safety issue with trying to call
+    // it anyways. So, to preserve the same behavior as before this `fstatfs`
+    // check was introduced, we assume `sync_file_range` is usable.
+    return true;
+  }
+  if (buf.f_type == ZFS_SUPER_MAGIC) {
+    // Testing on ZFS showed the writeback did not happen asynchronously when
+    // `sync_file_range` was called, even though it returned success. Avoid it
+    // and use `fdatasync` instead to preserve the contract of `bytes_per_sync`,
+    // even though this'll incur extra I/O for metadata.
+    return false;
+  }
+  // No known problems with other filesystems' implementations of
+  // `sync_file_range`, so allow them to use it.
+  return true;
+}
+
+#undef ZFS_SUPER_MAGIC
+
+#endif  // ROCKSDB_RANGESYNC_PRESENT
+
+}  // anonymous namespace
 
 /*
  * DirectIOHelper
@@ -141,7 +231,7 @@ bool IsSectorAligned(const void* ptr, size_t sector_size) {
   return uintptr_t(ptr) % sector_size == 0;
 }
 
-}
+}  // namespace
 #endif
 
 /*
@@ -713,9 +803,9 @@ Status PosixMmapFile::Allocate(uint64_t offset, uint64_t len) {
   TEST_KILL_RANDOM("PosixMmapFile::Allocate:0", rocksdb_kill_odds);
   int alloc_status = 0;
   if (allow_fallocate_) {
-    alloc_status = fallocate(
-        fd_, fallocate_with_keep_size_ ? FALLOC_FL_KEEP_SIZE : 0,
-          static_cast<off_t>(offset), static_cast<off_t>(len));
+    alloc_status =
+        fallocate(fd_, fallocate_with_keep_size_ ? FALLOC_FL_KEEP_SIZE : 0,
+                  static_cast<off_t>(offset), static_cast<off_t>(len));
   }
   if (alloc_status == 0) {
     return Status::OK();
@@ -734,7 +824,8 @@ Status PosixMmapFile::Allocate(uint64_t offset, uint64_t len) {
  */
 PosixWritableFile::PosixWritableFile(const std::string& fname, int fd,
                                      const EnvOptions& options)
-    : filename_(fname),
+    : WritableFile(options),
+      filename_(fname),
       use_direct_io_(options.use_direct_writes),
       fd_(fd),
       filesize_(0),
@@ -743,6 +834,9 @@ PosixWritableFile::PosixWritableFile(const std::string& fname, int fd,
   allow_fallocate_ = options.allow_fallocate;
   fallocate_with_keep_size_ = options.fallocate_with_keep_size;
 #endif
+#ifdef ROCKSDB_RANGESYNC_PRESENT
+  sync_file_range_supported_ = IsSyncFileRangeSupported(fd_);
+#endif  // ROCKSDB_RANGESYNC_PRESENT
   assert(!options.use_mmap_writes);
 }
 
@@ -758,19 +852,13 @@ Status PosixWritableFile::Append(const Slice& data) {
     assert(IsSectorAligned(data.data(), GetRequiredBufferAlignment()));
   }
   const char* src = data.data();
-  size_t left = data.size();
-  while (left != 0) {
-    ssize_t done = write(fd_, src, left);
-    if (done < 0) {
-      if (errno == EINTR) {
-        continue;
-      }
-      return IOError("While appending to file", filename_, errno);
-    }
-    left -= done;
-    src += done;
+  size_t nbytes = data.size();
+
+  if (!PosixWrite(fd_, src, nbytes)) {
+    return IOError("While appending to file", filename_, errno);
   }
-  filesize_ += data.size();
+
+  filesize_ += nbytes;
   return Status::OK();
 }
 
@@ -782,21 +870,12 @@ Status PosixWritableFile::PositionedAppend(const Slice& data, uint64_t offset) {
   }
   assert(offset <= std::numeric_limits<off_t>::max());
   const char* src = data.data();
-  size_t left = data.size();
-  while (left != 0) {
-    ssize_t done = pwrite(fd_, src, left, static_cast<off_t>(offset));
-    if (done < 0) {
-      if (errno == EINTR) {
-        continue;
-      }
-      return IOError("While pwrite to file at offset " + ToString(offset),
-                     filename_, errno);
-    }
-    left -= done;
-    offset += done;
-    src += done;
+  size_t nbytes = data.size();
+  if (!PosixPositionedWrite(fd_, src, nbytes, static_cast<off_t>(offset))) {
+    return IOError("While pwrite to file at offset " + ToString(offset),
+                   filename_, errno);
   }
-  filesize_ = offset;
+  filesize_ = offset + nbytes;
   return Status::OK();
 }
 
@@ -848,8 +927,8 @@ Status PosixWritableFile::Close() {
     // If not, we should hack it with FALLOC_FL_PUNCH_HOLE
     if (result == 0 &&
         (file_stats.st_size + file_stats.st_blksize - 1) /
-            file_stats.st_blksize !=
-        file_stats.st_blocks / (file_stats.st_blksize / 512)) {
+                file_stats.st_blksize !=
+            file_stats.st_blocks / (file_stats.st_blksize / 512)) {
       IOSTATS_TIMER_GUARD(allocate_nanos);
       if (allow_fallocate_) {
         fallocate(fd_, FALLOC_FL_KEEP_SIZE | FALLOC_FL_PUNCH_HOLE, filesize_,
@@ -899,10 +978,10 @@ void PosixWritableFile::SetWriteLifeTimeHint(Env::WriteLifeTimeHint hint) {
   }
 #else
   (void)hint;
-#endif // ROCKSDB_VALGRIND_RUN
+#endif  // ROCKSDB_VALGRIND_RUN
 #else
   (void)hint;
-#endif // OS_LINUX
+#endif  // OS_LINUX
 }
 
 Status PosixWritableFile::InvalidateCache(size_t offset, size_t length) {
@@ -931,9 +1010,9 @@ Status PosixWritableFile::Allocate(uint64_t offset, uint64_t len) {
   IOSTATS_TIMER_GUARD(allocate_nanos);
   int alloc_status = 0;
   if (allow_fallocate_) {
-    alloc_status = fallocate(
-        fd_, fallocate_with_keep_size_ ? FALLOC_FL_KEEP_SIZE : 0,
-        static_cast<off_t>(offset), static_cast<off_t>(len));
+    alloc_status =
+        fallocate(fd_, fallocate_with_keep_size_ ? FALLOC_FL_KEEP_SIZE : 0,
+                  static_cast<off_t>(offset), static_cast<off_t>(len));
   }
   if (alloc_status == 0) {
     return Status::OK();
@@ -945,20 +1024,32 @@ Status PosixWritableFile::Allocate(uint64_t offset, uint64_t len) {
 }
 #endif
 
-#ifdef ROCKSDB_RANGESYNC_PRESENT
 Status PosixWritableFile::RangeSync(uint64_t offset, uint64_t nbytes) {
+#ifdef ROCKSDB_RANGESYNC_PRESENT
   assert(offset <= std::numeric_limits<off_t>::max());
   assert(nbytes <= std::numeric_limits<off_t>::max());
-  if (sync_file_range(fd_, static_cast<off_t>(offset),
-      static_cast<off_t>(nbytes), SYNC_FILE_RANGE_WRITE) == 0) {
+  if (sync_file_range_supported_) {
+    int ret;
+    if (strict_bytes_per_sync_) {
+      // Specifying `SYNC_FILE_RANGE_WAIT_BEFORE` together with an offset/length
+      // that spans all bytes written so far tells `sync_file_range` to wait for
+      // any outstanding writeback requests to finish before issuing a new one.
+      ret =
+          sync_file_range(fd_, 0, static_cast<off_t>(offset + nbytes),
+                          SYNC_FILE_RANGE_WAIT_BEFORE | SYNC_FILE_RANGE_WRITE);
+    } else {
+      ret = sync_file_range(fd_, static_cast<off_t>(offset),
+                            static_cast<off_t>(nbytes), SYNC_FILE_RANGE_WRITE);
+    }
+    if (ret != 0) {
+      return IOError("While sync_file_range returned " + ToString(ret),
+                     filename_, errno);
+    }
     return Status::OK();
-  } else {
-    return IOError("While sync_file_range offset " + ToString(offset) +
-                       " bytes " + ToString(nbytes),
-                   filename_, errno);
   }
+#endif  // ROCKSDB_RANGESYNC_PRESENT
+  return WritableFile::RangeSync(offset, nbytes);
 }
-#endif
 
 #ifdef OS_LINUX
 size_t PosixWritableFile::GetUniqueId(char* id, size_t max_size) const {
@@ -982,24 +1073,11 @@ PosixRandomRWFile::~PosixRandomRWFile() {
 
 Status PosixRandomRWFile::Write(uint64_t offset, const Slice& data) {
   const char* src = data.data();
-  size_t left = data.size();
-  while (left != 0) {
-    ssize_t done = pwrite(fd_, src, left, offset);
-    if (done < 0) {
-      // error while writing to file
-      if (errno == EINTR) {
-        // write was interrupted, try again.
-        continue;
-      }
-      return IOError(
-          "While write random read/write file at offset " + ToString(offset),
-          filename_, errno);
-    }
-
-    // Wrote `done` bytes
-    left -= done;
-    offset += done;
-    src += done;
+  size_t nbytes = data.size();
+  if (!PosixPositionedWrite(fd_, src, nbytes, static_cast<off_t>(offset))) {
+    return IOError(
+        "While write random read/write file at offset " + ToString(offset),
+        filename_, errno);
   }
 
   return Status::OK();

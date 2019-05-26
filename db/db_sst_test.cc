@@ -356,6 +356,14 @@ TEST_F(DBSSTTest, RateLimitedDelete) {
   env_->time_elapse_only_sleep_ = true;
   Options options = CurrentOptions();
   options.disable_auto_compactions = true;
+  // Need to disable stats dumping and persisting which also use
+  // RepeatableThread, one of whose member variables is of type
+  // InstrumentedCondVar. The callback for
+  // InstrumentedCondVar::TimedWaitInternal can be triggered by stats dumping
+  // and persisting threads and cause time_spent_deleting measurement to become
+  // incorrect.
+  options.stats_dump_period_sec = 0;
+  options.stats_persist_period_sec = 0;
   options.env = env_;
 
   int64_t rate_bytes_per_sec = 1024 * 10;  // 10 Kbs / Sec
@@ -449,7 +457,9 @@ TEST_F(DBSSTTest, RateLimitedWALDelete) {
   ASSERT_EQ("4", FilesPerLevel(0));
 
   // Compaction will move the 4 files in L0 to trash and create 1 L1 file
-  ASSERT_OK(db_->CompactRange(CompactRangeOptions(), nullptr, nullptr));
+  CompactRangeOptions cro;
+  cro.bottommost_level_compaction = BottommostLevelCompaction::kForce;
+  ASSERT_OK(db_->CompactRange(cro, nullptr, nullptr));
   ASSERT_OK(dbfull()->TEST_WaitForCompact(true));
   ASSERT_EQ("0,1", FilesPerLevel(0));
 
@@ -555,7 +565,7 @@ TEST_F(DBSSTTest, DeleteSchedulerMultipleDBPaths) {
   // Compaction will delete both files and regenerate a file in L1 in second
   // db path. The deleted files should still be cleaned up via delete scheduler.
   compact_options.bottommost_level_compaction =
-      BottommostLevelCompaction::kForce;
+      BottommostLevelCompaction::kForceOptimized;
   ASSERT_OK(db_->CompactRange(compact_options, nullptr, nullptr));
   ASSERT_EQ("0,1", FilesPerLevel(0));
 

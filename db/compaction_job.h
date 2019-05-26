@@ -55,24 +55,27 @@ class Version;
 class VersionEdit;
 class VersionSet;
 
+// CompactionJob is responsible for executing the compaction. Each (manual or
+// automated) compaction corresponds to a CompactionJob object, and usually
+// goes through the stages of `Prepare()`->`Run()`->`Install()`. CompactionJob
+// will divide the compaction into subcompactions and execute them in parallel
+// if needed.
 class CompactionJob {
  public:
-  CompactionJob(int job_id, Compaction* compaction,
-                const ImmutableDBOptions& db_options,
-                const EnvOptions env_options, VersionSet* versions,
-                const std::atomic<bool>* shutting_down,
-                const SequenceNumber preserve_deletes_seqnum,
-                LogBuffer* log_buffer, Directory* db_directory,
-                Directory* output_directory, Statistics* stats,
-                InstrumentedMutex* db_mutex, ErrorHandler* db_error_handler,
-                std::vector<SequenceNumber> existing_snapshots,
-                SequenceNumber earliest_write_conflict_snapshot,
-                const SnapshotChecker* snapshot_checker,
-                std::shared_ptr<Cache> table_cache, EventLogger* event_logger,
-                bool paranoid_file_checks, bool measure_io_stats,
-                const std::string& dbname,
-                CompactionJobStats* compaction_job_stats,
-                Env::Priority thread_pri);
+  CompactionJob(
+      int job_id, Compaction* compaction, const ImmutableDBOptions& db_options,
+      const EnvOptions env_options, VersionSet* versions,
+      const std::atomic<bool>* shutting_down,
+      const SequenceNumber preserve_deletes_seqnum, LogBuffer* log_buffer,
+      Directory* db_directory, Directory* output_directory, Statistics* stats,
+      InstrumentedMutex* db_mutex, ErrorHandler* db_error_handler,
+      std::vector<SequenceNumber> existing_snapshots,
+      SequenceNumber earliest_write_conflict_snapshot,
+      const SnapshotChecker* snapshot_checker,
+      std::shared_ptr<Cache> table_cache, EventLogger* event_logger,
+      bool paranoid_file_checks, bool measure_io_stats,
+      const std::string& dbname, CompactionJobStats* compaction_job_stats,
+      Env::Priority thread_pri, SnapshotListFetchCallback* snap_list_callback);
 
   ~CompactionJob();
 
@@ -82,17 +85,28 @@ class CompactionJob {
   CompactionJob& operator=(const CompactionJob& job) = delete;
 
   // REQUIRED: mutex held
+  // Prepare for the compaction by setting up boundaries for each subcompaction
   void Prepare();
   // REQUIRED mutex not held
+  // Launch threads for each subcompaction and wait for them to finish. After
+  // that, verify table is usable and finally do bookkeeping to unify
+  // subcompaction results
   Status Run();
 
   // REQUIRED: mutex held
+  // Add compaction input/output to the current version
   Status Install(const MutableCFOptions& mutable_cf_options);
 
  private:
   struct SubcompactionState;
 
   void AggregateStatistics();
+
+  // Generates a histogram representing potential divisions of key ranges from
+  // the input. It adds the starting and/or ending keys of certain input files
+  // to the working set and then finds the approximate size of data in between
+  // each consecutive pair of slices. Then it divides these ranges into
+  // consecutive groups such that each group has a similar size.
   void GenSubcompactionBoundaries();
 
   // update the thread status for starting a compaction.
@@ -152,6 +166,7 @@ class CompactionJob {
   // entirely within s1 and s2, then the earlier version of k1 can be safely
   // deleted because that version is not visible in any snapshot.
   std::vector<SequenceNumber> existing_snapshots_;
+  SnapshotListFetchCallback* snap_list_callback_;
 
   // This is the earliest snapshot that could be used for write-conflict
   // checking by a transaction.  For any user-key newer than this snapshot, we
@@ -164,6 +179,7 @@ class CompactionJob {
 
   EventLogger* event_logger_;
 
+  // Is this compaction creating a file in the bottom most level?
   bool bottommost_level_;
   bool paranoid_file_checks_;
   bool measure_io_stats_;

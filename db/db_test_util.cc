@@ -341,6 +341,7 @@ Options DBTestBase::GetOptions(
       options.prefix_extractor.reset(NewFixedPrefixTransform(1));
       options.memtable_factory.reset(NewHashSkipListRepFactory(16));
       options.allow_concurrent_memtable_write = false;
+      options.unordered_write = false;
       break;
     case kPlainTableFirstBytePrefix:
       options.table_factory.reset(new PlainTableFactory());
@@ -373,12 +374,14 @@ Options DBTestBase::GetOptions(
     case kVectorRep:
       options.memtable_factory.reset(new VectorRepFactory(100));
       options.allow_concurrent_memtable_write = false;
+      options.unordered_write = false;
       break;
     case kHashLinkList:
       options.prefix_extractor.reset(NewFixedPrefixTransform(1));
       options.memtable_factory.reset(
           NewHashLinkListRepFactory(4, 0, 3, true, 4));
       options.allow_concurrent_memtable_write = false;
+      options.unordered_write = false;
       break;
       case kDirectIO: {
         options.use_direct_reads = true;
@@ -538,6 +541,11 @@ Options DBTestBase::GetOptions(
       // This options optimize 2PC commit path
       options.two_write_queues = true;
       options.manual_wal_flush = true;
+      break;
+    }
+    case kUnorderedWrite: {
+      options.allow_concurrent_memtable_write = false;
+      options.unordered_write = false;
       break;
     }
 
@@ -775,6 +783,34 @@ std::vector<std::string> DBTestBase::MultiGet(std::vector<int> cfs,
       result[i] = "NOT_FOUND";
     } else if (!s[i].ok()) {
       result[i] = s[i].ToString();
+    }
+  }
+  return result;
+}
+
+std::vector<std::string> DBTestBase::MultiGet(const std::vector<std::string>& k,
+                                              const Snapshot* snapshot) {
+  ReadOptions options;
+  options.verify_checksums = true;
+  options.snapshot = snapshot;
+  std::vector<Slice> keys;
+  std::vector<std::string> result;
+  std::vector<Status> statuses(k.size());
+  std::vector<PinnableSlice> pin_values(k.size());
+
+  for (unsigned int i = 0; i < k.size(); ++i) {
+    keys.push_back(k[i]);
+  }
+  db_->MultiGet(options, dbfull()->DefaultColumnFamily(), keys.size(),
+                keys.data(), pin_values.data(), statuses.data());
+  result.resize(k.size());
+  for (auto iter = result.begin(); iter != result.end(); ++iter) {
+    iter->assign(pin_values[iter - result.begin()].data(),
+                 pin_values[iter - result.begin()].size());
+  }
+  for (unsigned int i = 0; i < statuses.size(); ++i) {
+    if (statuses[i].IsNotFound()) {
+      result[i] = "NOT_FOUND";
     }
   }
   return result;

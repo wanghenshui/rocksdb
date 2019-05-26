@@ -205,6 +205,12 @@ bool RandomTransactionInserter::DoInsert(DB* db, Transaction* txn,
         ROCKS_LOG_DEBUG(db->GetDBOptions().info_log,
                         "Prepare of %" PRIu64 " %s (%s)", txn->GetId(),
                         s.ToString().c_str(), txn->GetName().c_str());
+        if (rand_->OneIn(20)) {
+          // This currently only tests the mechanics of writing commit time
+          // write batch so the exact values would not matter.
+          s = txn_->GetCommitTimeWriteBatch()->Put("cat", "dog");
+          assert(s.ok());
+        }
         db->GetDBOptions().env->SleepForMicroseconds(
             static_cast<int>(cmt_delay_ms_ * 1000));
       }
@@ -344,7 +350,7 @@ Status RandomTransactionInserter::Verify(DB* db, uint16_t num_sets,
             roptions.snapshot
                 ? ((SnapshotImpl*)roptions.snapshot)->min_uncommitted_
                 : 0ul,
-            key.size(), key.data(), int_value);
+            static_cast<int>(key.size()), key.data(), int_value);
         total += int_value;
       }
       delete iter;

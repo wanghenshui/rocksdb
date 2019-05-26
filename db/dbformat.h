@@ -9,8 +9,11 @@
 
 #pragma once
 #include <stdio.h>
+#include <memory>
 #include <string>
 #include <utility>
+#include "db/lookup_key.h"
+#include "db/merge_context.h"
 #include "monitoring/perf_context_imp.h"
 #include "rocksdb/comparator.h"
 #include "rocksdb/db.h"
@@ -24,6 +27,12 @@
 #include "util/user_comparator_wrapper.h"
 
 namespace rocksdb {
+
+// The file declares data structures and functions that deal with internal
+// keys.
+// Each internal key contains a user key, a sequence number (SequenceNumber)
+// and a type (ValueType), and they are usually encoded together.
+// There are some related helper classes here.
 
 class InternalKey;
 
@@ -85,6 +94,8 @@ static const SequenceNumber kMaxSequenceNumber = ((0x1ull << 56) - 1);
 
 static const SequenceNumber kDisableGlobalSequenceNumber = port::kMaxUint64;
 
+// The data structure that represents an internal key in the way that user_key,
+// sequence number and type are stored in separated forms.
 struct ParsedInternalKey {
   Slice user_key;
   SequenceNumber sequence;
@@ -189,9 +200,7 @@ class InternalKeyComparator
   }
 };
 
-// Modules in this directory should keep internal keys wrapped inside
-// the following class instead of plain strings so that we do not
-// incorrectly use string comparisons instead of an InternalKeyComparator.
+// The class represent the internal key in encoded form.
 class InternalKey {
  private:
   std::string rep_;
@@ -292,52 +301,12 @@ inline uint64_t GetInternalKeySeqno(const Slice& internal_key) {
   return num >> 8;
 }
 
-// A helper class useful for DBImpl::Get()
-class LookupKey {
- public:
-  // Initialize *this for looking up user_key at a snapshot with
-  // the specified sequence number.
-  LookupKey(const Slice& _user_key, SequenceNumber sequence);
-
-  ~LookupKey();
-
-  // Return a key suitable for lookup in a MemTable.
-  Slice memtable_key() const {
-    return Slice(start_, static_cast<size_t>(end_ - start_));
-  }
-
-  // Return an internal key (suitable for passing to an internal iterator)
-  Slice internal_key() const {
-    return Slice(kstart_, static_cast<size_t>(end_ - kstart_));
-  }
-
-  // Return the user key
-  Slice user_key() const {
-    return Slice(kstart_, static_cast<size_t>(end_ - kstart_ - 8));
-  }
-
- private:
-  // We construct a char array of the form:
-  //    klength  varint32               <-- start_
-  //    userkey  char[klength]          <-- kstart_
-  //    tag      uint64
-  //                                    <-- end_
-  // The array is a suitable MemTable key.
-  // The suffix starting with "userkey" can be used as an InternalKey.
-  const char* start_;
-  const char* kstart_;
-  const char* end_;
-  char space_[200];  // Avoid allocation for short keys
-
-  // No copying allowed
-  LookupKey(const LookupKey&);
-  void operator=(const LookupKey&);
-};
-
-inline LookupKey::~LookupKey() {
-  if (start_ != space_) delete[] start_;
-}
-
+// The class to store keys in an efficient way. It allows:
+// 1. Users can either copy the key into it, or have it point to an unowned
+//    address.
+// 2. For copied key, a short inline buffer is kept to reduce memory
+//    allocation for smaller keys.
+// 3. It tracks user key or internal key, and allow conversion between them.
 class IterKey {
  public:
   IterKey()
@@ -549,6 +518,8 @@ class IterKey {
   void operator=(const IterKey&) = delete;
 };
 
+// Convert from a SliceTranform of user keys, to a SliceTransform of
+// user keys.
 class InternalKeySliceTransform : public SliceTransform {
  public:
   explicit InternalKeySliceTransform(const SliceTransform* transform)
@@ -674,6 +645,7 @@ inline int InternalKeyComparator::CompareKeySeq(const Slice& akey,
   return r;
 }
 
+// Wrap InternalKeyComparator as a comparator class for ParsedInternalKey.
 struct ParsedInternalKeyComparator {
   explicit ParsedInternalKeyComparator(const InternalKeyComparator* c)
       : cmp(c) {}

@@ -20,7 +20,8 @@ class WriteUnpreparedTransactionTestBase : public TransactionTestBase {
   WriteUnpreparedTransactionTestBase(bool use_stackable_db,
                                      bool two_write_queue,
                                      TxnDBWritePolicy write_policy)
-      : TransactionTestBase(use_stackable_db, two_write_queue, write_policy){}
+      : TransactionTestBase(use_stackable_db, two_write_queue, write_policy,
+                            kOrderedWrite) {}
 };
 
 class WriteUnpreparedTransactionTest
@@ -81,12 +82,12 @@ TEST_P(WriteUnpreparedTransactionTest, ReadYourOwnWrite) {
   ReadOptions roptions;
   roptions.snapshot = snapshot0;
 
+  wup_txn->unprep_seqs_[snapshot2->GetSequenceNumber() + 1] =
+      snapshot4->GetSequenceNumber() - snapshot2->GetSequenceNumber();
   auto iter = txn->GetIterator(roptions);
 
   // Test Get().
   std::string value;
-  wup_txn->unprep_seqs_[snapshot2->GetSequenceNumber() + 1] =
-      snapshot4->GetSequenceNumber() - snapshot2->GetSequenceNumber();
 
   ASSERT_OK(txn->Get(roptions, Slice("a"), &value));
   ASSERT_EQ(value, "v3");
@@ -96,6 +97,8 @@ TEST_P(WriteUnpreparedTransactionTest, ReadYourOwnWrite) {
 
   wup_txn->unprep_seqs_[snapshot6->GetSequenceNumber() + 1] =
       snapshot8->GetSequenceNumber() - snapshot6->GetSequenceNumber();
+  delete iter;
+  iter = txn->GetIterator(roptions);
 
   ASSERT_OK(txn->Get(roptions, Slice("a"), &value));
   ASSERT_EQ(value, "v7");
@@ -108,6 +111,8 @@ TEST_P(WriteUnpreparedTransactionTest, ReadYourOwnWrite) {
   // Test Next().
   wup_txn->unprep_seqs_[snapshot2->GetSequenceNumber() + 1] =
       snapshot4->GetSequenceNumber() - snapshot2->GetSequenceNumber();
+  delete iter;
+  iter = txn->GetIterator(roptions);
 
   iter->Seek("a");
   verify_state(iter, "a", "v3");
@@ -123,6 +128,8 @@ TEST_P(WriteUnpreparedTransactionTest, ReadYourOwnWrite) {
 
   wup_txn->unprep_seqs_[snapshot6->GetSequenceNumber() + 1] =
       snapshot8->GetSequenceNumber() - snapshot6->GetSequenceNumber();
+  delete iter;
+  iter = txn->GetIterator(roptions);
 
   iter->Seek("a");
   verify_state(iter, "a", "v7");
@@ -143,11 +150,11 @@ TEST_P(WriteUnpreparedTransactionTest, ReadYourOwnWrite) {
   //
   // Because of row locks and ValidateSnapshot, there cannot be any committed
   // entries after snapshot, but before the first prepared key.
-  delete iter;
   roptions.snapshot = snapshot2;
-  iter = txn->GetIterator(roptions);
   wup_txn->unprep_seqs_[snapshot2->GetSequenceNumber() + 1] =
       snapshot4->GetSequenceNumber() - snapshot2->GetSequenceNumber();
+  delete iter;
+  iter = txn->GetIterator(roptions);
 
   iter->SeekForPrev("b");
   verify_state(iter, "b", "v4");
@@ -161,11 +168,11 @@ TEST_P(WriteUnpreparedTransactionTest, ReadYourOwnWrite) {
   iter->Prev();
   verify_state(iter, "a", "v3");
 
-  delete iter;
   roptions.snapshot = snapshot6;
-  iter = txn->GetIterator(roptions);
   wup_txn->unprep_seqs_[snapshot6->GetSequenceNumber() + 1] =
       snapshot8->GetSequenceNumber() - snapshot6->GetSequenceNumber();
+  delete iter;
+  iter = txn->GetIterator(roptions);
 
   iter->SeekForPrev("b");
   verify_state(iter, "b", "v8");

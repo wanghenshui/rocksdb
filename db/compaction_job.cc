@@ -97,6 +97,8 @@ const char* GetCompactionReasonString(CompactionReason compaction_reason) {
       return "Flush";
     case CompactionReason::kExternalSstIngestion:
       return "ExternalSstIngestion";
+    case CompactionReason::kPeriodicCompaction:
+      return "PeriodicCompaction";
     case CompactionReason::kNumOfReasons:
       // fall through
     default:
@@ -313,7 +315,7 @@ CompactionJob::CompactionJob(
     const SnapshotChecker* snapshot_checker, std::shared_ptr<Cache> table_cache,
     EventLogger* event_logger, bool paranoid_file_checks, bool measure_io_stats,
     const std::string& dbname, CompactionJobStats* compaction_job_stats,
-    Env::Priority thread_pri)
+    Env::Priority thread_pri, SnapshotListFetchCallback* snap_list_callback)
     : job_id_(job_id),
       compact_(new CompactionState(compaction)),
       compaction_job_stats_(compaction_job_stats),
@@ -334,6 +336,7 @@ CompactionJob::CompactionJob(
       db_mutex_(db_mutex),
       db_error_handler_(db_error_handler),
       existing_snapshots_(std::move(existing_snapshots)),
+      snap_list_callback_(snap_list_callback),
       earliest_write_conflict_snapshot_(earliest_write_conflict_snapshot),
       snapshot_checker_(snapshot_checker),
       table_cache_(std::move(table_cache)),
@@ -412,7 +415,6 @@ void CompactionJob::Prepare() {
 
   write_hint_ =
       c->column_family_data()->CalculateSSTWriteHint(c->output_level());
-  // Is this compaction producing files at the bottommost level?
   bottommost_level_ = c->bottommost_level();
 
   if (c->ShouldFormSubcompactions()) {
@@ -442,11 +444,6 @@ struct RangeWithSize {
       : range(a, b), size(s) {}
 };
 
-// Generates a histogram representing potential divisions of key ranges from
-// the input. It adds the starting and/or ending keys of certain input files
-// to the working set and then finds the approximate size of data in between
-// each consecutive pair of slices. Then it divides these ranges into
-// consecutive groups such that each group has a similar size.
 void CompactionJob::GenSubcompactionBoundaries() {
   auto* c = compact_->compaction;
   auto* cfd = c->column_family_data();
@@ -516,7 +513,7 @@ void CompactionJob::GenSubcompactionBoundaries() {
   auto* v = compact_->compaction->input_version();
   for (auto it = bounds.begin();;) {
     const Slice a = *it;
-    it++;
+    ++it;
 
     if (it == bounds.end()) {
       break;
@@ -890,7 +887,9 @@ void CompactionJob::ProcessKeyValueCompaction(SubcompactionState* sub_compact) {
       &existing_snapshots_, earliest_write_conflict_snapshot_,
       snapshot_checker_, env_, ShouldReportDetailedTime(env_, stats_), false,
       &range_del_agg, sub_compact->compaction, compaction_filter,
-      shutting_down_, preserve_deletes_seqnum_));
+      shutting_down_, preserve_deletes_seqnum_,
+      // Currently range_del_agg is incompatible with snapshot refresh feature.
+      range_del_agg.IsEmpty() ? snap_list_callback_ : nullptr));
   auto c_iter = sub_compact->c_iter.get();
   c_iter->SeekToFirst();
   if (c_iter->Valid() && sub_compact->compaction->output_level() != 0) {
@@ -999,10 +998,13 @@ void CompactionJob::ProcessKeyValueCompaction(SubcompactionState* sub_compact) {
   RecordDroppedKeys(c_iter_stats, &sub_compact->compaction_job_stats);
   RecordCompactionIOStats();
 
-  if (status.ok() &&
-      (shutting_down_->load(std::memory_order_relaxed) || cfd->IsDropped())) {
-    status = Status::ShutdownInProgress(
-        "Database shutdown or Column family drop during compaction");
+  if (status.ok() && cfd->IsDropped()) {
+    status =
+        Status::ColumnFamilyDropped("Column family dropped during compaction");
+  }
+  if ((status.ok() || status.IsColumnFamilyDropped()) &&
+      shutting_down_->load(std::memory_order_relaxed)) {
+    status = Status::ShutdownInProgress("Database shutdown");
   }
   if (status.ok()) {
     status = input->status();
@@ -1480,20 +1482,20 @@ Status CompactionJob::OpenCompactionOutputFile(
   bool skip_filters =
       cfd->ioptions()->optimize_filters_for_hits && bottommost_level_;
 
-  uint64_t output_file_creation_time =
+  int64_t temp_current_time = 0;
+  auto get_time_status = env_->GetCurrentTime(&temp_current_time);
+  // Safe to proceed even if GetCurrentTime fails. So, log and proceed.
+  if (!get_time_status.ok()) {
+    ROCKS_LOG_WARN(db_options_.info_log,
+                   "Failed to get current time. Status: %s",
+                   get_time_status.ToString().c_str());
+  }
+  uint64_t current_time = static_cast<uint64_t>(temp_current_time);
+
+  uint64_t latest_key_time =
       sub_compact->compaction->MaxInputFileCreationTime();
-  if (output_file_creation_time == 0) {
-    int64_t _current_time = 0;
-    auto status = db_options_.env->GetCurrentTime(&_current_time);
-    // Safe to proceed even if GetCurrentTime fails. So, log and proceed.
-    if (!status.ok()) {
-      ROCKS_LOG_WARN(
-          db_options_.info_log,
-          "Failed to get current time to populate creation_time property. "
-          "Status: %s",
-          status.ToString().c_str());
-    }
-    output_file_creation_time = static_cast<uint64_t>(_current_time);
+  if (latest_key_time == 0) {
+    latest_key_time = current_time;
   }
 
   sub_compact->builder.reset(NewTableBuilder(
@@ -1503,9 +1505,9 @@ Status CompactionJob::OpenCompactionOutputFile(
       sub_compact->compaction->output_compression(),
       0 /*sample_for_compression */,
       sub_compact->compaction->output_compression_opts(),
-      sub_compact->compaction->output_level(), skip_filters,
-      output_file_creation_time, 0 /* oldest_key_time */,
-      sub_compact->compaction->max_output_file_size()));
+      sub_compact->compaction->output_level(), skip_filters, latest_key_time,
+      0 /* oldest_key_time */, sub_compact->compaction->max_output_file_size(),
+      current_time));
   LogFlush(db_options_.info_log);
   return s;
 }

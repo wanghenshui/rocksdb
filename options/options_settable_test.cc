@@ -143,6 +143,7 @@ TEST_F(OptionsSettableTest, BlockBasedTableOptionsAllFieldsSettable) {
       "pin_top_level_index_and_filter=1;"
       "index_type=kHashSearch;"
       "data_block_index_type=kDataBlockBinaryAndHash;"
+      "index_shortening=kNoShortening;"
       "data_block_hash_table_util_ratio=0.75;"
       "checksum=kxxHash;hash_index_allow_collision=1;no_block_cache=1;"
       "block_cache=1M;block_cache_compressed=1k;block_size=1024;"
@@ -255,6 +256,7 @@ TEST_F(OptionsSettableTest, DBOptionsAllFieldsSettable) {
                              "paranoid_checks=true;"
                              "is_fd_close_on_exec=false;"
                              "bytes_per_sync=4295013613;"
+                             "strict_bytes_per_sync=true;"
                              "enable_thread_tracking=false;"
                              "recycle_log_file_num=0;"
                              "create_missing_column_families=true;"
@@ -277,6 +279,7 @@ TEST_F(OptionsSettableTest, DBOptionsAllFieldsSettable) {
                              "advise_random_on_open=true;"
                              "fail_if_options_file_error=false;"
                              "enable_pipelined_write=false;"
+                             "unordered_write=false;"
                              "allow_concurrent_memtable_write=true;"
                              "wal_recovery_mode=kPointInTimeRecovery;"
                              "enable_write_thread_adaptive_yield=true;"
@@ -294,7 +297,8 @@ TEST_F(OptionsSettableTest, DBOptionsAllFieldsSettable) {
                              "two_write_queues=false;"
                              "manual_wal_flush=false;"
                              "seq_per_batch=false;"
-                             "atomic_flush=false",
+                             "atomic_flush=false;"
+                             "avoid_unnecessary_blocking_io=false",
                              new_options));
 
   ASSERT_EQ(unset_bytes_base, NumUnsetBytes(new_options_ptr, sizeof(DBOptions),
@@ -412,6 +416,7 @@ TEST_F(OptionsSettableTest, ColumnFamilyOptionsAllFieldsSettable) {
       "kBZip2Compression:kNoCompression:kZlibCompression:kBZip2Compression:"
       "kSnappyCompression;"
       "max_bytes_for_level_base=986;"
+      "snap_refresh_nanos=1000000000;"
       "bloom_locality=8016;"
       "target_file_size_base=4294976376;"
       "memtable_huge_page_size=2557;"
@@ -451,6 +456,7 @@ TEST_F(OptionsSettableTest, ColumnFamilyOptionsAllFieldsSettable) {
       "disable_auto_compactions=false;"
       "report_bg_io_stats=true;"
       "ttl=60;"
+      "periodic_compaction_seconds=3600;"
       "sample_for_compression=0;"
       "compaction_options_fifo={max_table_files_size=3;allow_"
       "compaction=false;};",

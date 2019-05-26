@@ -134,7 +134,8 @@ Compaction* FIFOCompactionPicker::PickSizeCompaction(
               mutable_cf_options
                   .level0_file_num_compaction_trigger /* min_files_to_compact */
               ,
-              max_compact_bytes_per_del_file, &comp_inputs)) {
+              max_compact_bytes_per_del_file,
+              mutable_cf_options.max_compaction_bytes, &comp_inputs)) {
         Compaction* c = new Compaction(
             vstorage, ioptions_, mutable_cf_options, {comp_inputs}, 0,
             16 * 1024 * 1024 /* output file size limit */,
@@ -213,9 +214,10 @@ Compaction* FIFOCompactionPicker::PickCompaction(
 Compaction* FIFOCompactionPicker::CompactRange(
     const std::string& cf_name, const MutableCFOptions& mutable_cf_options,
     VersionStorageInfo* vstorage, int input_level, int output_level,
-    uint32_t /*output_path_id*/, uint32_t /*max_subcompactions*/,
+    const CompactRangeOptions& /*compact_range_options*/,
     const InternalKey* /*begin*/, const InternalKey* /*end*/,
-    InternalKey** compaction_end, bool* /*manual_conflict*/) {
+    InternalKey** compaction_end, bool* /*manual_conflict*/,
+    uint64_t /*max_file_num_to_ignore*/) {
 #ifdef NDEBUG
   (void)input_level;
   (void)output_level;

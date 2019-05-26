@@ -92,7 +92,7 @@ else()
   endif()
 
   if(WITH_ZLIB)
-    find_package(zlib REQUIRED)
+    find_package(ZLIB REQUIRED)
     add_definitions(-DZLIB)
     if(ZLIB_INCLUDE_DIRS)
       # CMake 3
@@ -201,6 +201,15 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "ppc64le")
   endif(HAS_ALTIVEC)
 endif(CMAKE_SYSTEM_PROCESSOR MATCHES "ppc64le")
 
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|AARCH64")
+        CHECK_C_COMPILER_FLAG("-march=armv8-a+crc" HAS_ARMV8_CRC)
+  if(HAS_ARMV8_CRC)
+    message(STATUS " HAS_ARMV8_CRC yes")
+    set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -march=armv8-a+crc -Wno-unused-function")
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -march=armv8-a+crc -Wno-unused-function")
+  endif(HAS_ARMV8_CRC)
+endif(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|AARCH64")
+
 option(PORTABLE "build a portable binary" OFF)
 option(FORCE_SSE42 "force building with SSE4.2, even when PORTABLE=ON" OFF)
 if(PORTABLE)
@@ -213,7 +222,7 @@ else()
   if(MSVC)
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /arch:AVX2")
   else()
-    if(NOT HAVE_POWER8)
+    if(NOT HAVE_POWER8 AND NOT HAS_ARMV8_CRC)
       set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -march=native")
     endif()
   endif()
@@ -461,8 +470,6 @@ include_directories(${PROJECT_SOURCE_DIR}/include)
 include_directories(SYSTEM ${PROJECT_SOURCE_DIR}/third-party/gtest-1.7.0/fused-src)
 find_package(Threads REQUIRED)
 
-add_subdirectory(third-party/gtest-1.7.0/fused-src/gtest)
-
 # Main library source code
 
 set(SOURCES
@@ -696,6 +703,11 @@ if(HAVE_POWER8)
     util/crc32c_ppc_asm.S)
 endif(HAVE_POWER8)
 
+if(HAS_ARMV8_CRC)
+  list(APPEND SOURCES
+    util/crc32c_arm64.cc)
+endif(HAS_ARMV8_CRC)
+
 if(WIN32)
   list(APPEND SOURCES
     port/win/io_win.cc
@@ -843,6 +855,7 @@ endif()
 
 option(WITH_TESTS "build with tests" ON)
 if(WITH_TESTS)
+  add_subdirectory(third-party/gtest-1.7.0/fused-src/gtest)
   set(TESTS
         cache/cache_test.cc
         cache/lru_cache_test.cc

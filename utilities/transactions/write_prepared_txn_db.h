@@ -25,6 +25,7 @@
 #include "rocksdb/db.h"
 #include "rocksdb/options.h"
 #include "rocksdb/utilities/transaction_db.h"
+#include "util/cast_util.h"
 #include "util/set_comparator.h"
 #include "util/string_util.h"
 #include "utilities/transactions/pessimistic_transaction.h"
@@ -110,12 +111,13 @@ class WritePreparedTxnDB : public PessimisticTransactionDB {
   // If the snapshot_seq is already released and snapshot_seq <= max, sets
   // *snap_released to true and returns true as well.
   inline bool IsInSnapshot(uint64_t prep_seq, uint64_t snapshot_seq,
-                           uint64_t min_uncommitted = 0,
+                           uint64_t min_uncommitted = kMinUnCommittedSeq,
                            bool* snap_released = nullptr) const {
     ROCKS_LOG_DETAILS(info_log_,
                       "IsInSnapshot %" PRIu64 " in %" PRIu64
                       " min_uncommitted %" PRIu64,
                       prep_seq, snapshot_seq, min_uncommitted);
+    assert(min_uncommitted >= kMinUnCommittedSeq);
     // Caller is responsible to initialize snap_released.
     assert(snap_released == nullptr || *snap_released == false);
     // Here we try to infer the return value without looking into prepare list.
@@ -444,6 +446,20 @@ class WritePreparedTxnDB : public PessimisticTransactionDB {
  protected:
   virtual Status VerifyCFOptions(
       const ColumnFamilyOptions& cf_options) override;
+  // Assign the min and max sequence numbers for reading from the db. A seq >
+  // max is not valid, and a seq < min is valid, and a min <= seq < max requires
+  // further checkings. Normally max is defined by the snapshot and min is by
+  // minimum uncommitted seq.
+  inline bool AssignMinMaxSeqs(const Snapshot* snapshot, SequenceNumber* min,
+                               SequenceNumber* max);
+  // Validate is a snapshot sequence number is still valid based on the latest
+  // db status. backed_by_snapshot specifies if the number is baked by an actual
+  // snapshot object. order specified the memory order with which we load the
+  // atomic variables: relax is enough for the default since we care about last
+  // value seen by same thread.
+  inline bool ValidateSnapshot(
+      const SequenceNumber snap_seq, const bool backed_by_snapshot,
+      std::memory_order order = std::memory_order_relaxed);
 
  private:
   friend class PreparedHeap_BasicsTest_Test;
@@ -478,6 +494,7 @@ class WritePreparedTxnDB : public PessimisticTransactionDB {
   friend class WritePreparedTransactionTest_NonAtomicUpdateOfMaxEvictedSeq_Test;
   friend class WritePreparedTransactionTest_OldCommitMapGC_Test;
   friend class WritePreparedTransactionTest_RollbackTest_Test;
+  friend class WriteUnpreparedTxn;
   friend class WriteUnpreparedTxnDB;
   friend class WriteUnpreparedTransactionTest_RecoveryTest_Test;
 
@@ -730,6 +747,8 @@ class WritePreparedTxnDB : public PessimisticTransactionDB {
 
 class WritePreparedTxnReadCallback : public ReadCallback {
  public:
+  WritePreparedTxnReadCallback(WritePreparedTxnDB* db, SequenceNumber snapshot)
+      : ReadCallback(snapshot), db_(db) {}
   WritePreparedTxnReadCallback(WritePreparedTxnDB* db, SequenceNumber snapshot,
                                SequenceNumber min_uncommitted)
       : ReadCallback(snapshot, min_uncommitted), db_(db) {}
@@ -737,39 +756,51 @@ class WritePreparedTxnReadCallback : public ReadCallback {
   // Will be called to see if the seq number visible; if not it moves on to
   // the next seq number.
   inline virtual bool IsVisibleFullCheck(SequenceNumber seq) override {
-    return db_->IsInSnapshot(seq, snapshot_, min_uncommitted_);
+    auto snapshot = max_visible_seq_;
+    return db_->IsInSnapshot(seq, snapshot, min_uncommitted_);
   }
 
+  // TODO(myabandeh): override Refresh when Iterator::Refresh is supported
  private:
   WritePreparedTxnDB* db_;
 };
 
 class AddPreparedCallback : public PreReleaseCallback {
  public:
-  AddPreparedCallback(WritePreparedTxnDB* db, size_t sub_batch_cnt,
-                      bool two_write_queues)
+  AddPreparedCallback(WritePreparedTxnDB* db, DBImpl* db_impl,
+                      size_t sub_batch_cnt, bool two_write_queues,
+                      bool first_prepare_batch)
       : db_(db),
+        db_impl_(db_impl),
         sub_batch_cnt_(sub_batch_cnt),
-        two_write_queues_(two_write_queues) {
+        two_write_queues_(two_write_queues),
+        first_prepare_batch_(first_prepare_batch) {
     (void)two_write_queues_;  // to silence unused private field warning
   }
   virtual Status Callback(SequenceNumber prepare_seq,
-                          bool is_mem_disabled) override {
-#ifdef NDEBUG
-    (void)is_mem_disabled;
-#endif
+                          bool is_mem_disabled __attribute__((__unused__)),
+                          uint64_t log_number) override {
     // Always Prepare from the main queue
     assert(!two_write_queues_ || !is_mem_disabled);  // implies the 1st queue
     for (size_t i = 0; i < sub_batch_cnt_; i++) {
       db_->AddPrepared(prepare_seq + i);
+    }
+    if (first_prepare_batch_) {
+      assert(log_number != 0);
+      db_impl_->logs_with_prep_tracker()->MarkLogAsContainingPrepSection(
+          log_number);
     }
     return Status::OK();
   }
 
  private:
   WritePreparedTxnDB* db_;
+  DBImpl* db_impl_;
   size_t sub_batch_cnt_;
   bool two_write_queues_;
+  // It is 2PC and this is the first prepare batch. Always the case in 2PC
+  // unless it is WriteUnPrepared.
+  bool first_prepare_batch_;
 };
 
 class WritePreparedCommitEntryPreReleaseCallback : public PreReleaseCallback {
@@ -795,10 +826,8 @@ class WritePreparedCommitEntryPreReleaseCallback : public PreReleaseCallback {
   }
 
   virtual Status Callback(SequenceNumber commit_seq,
-                          bool is_mem_disabled) override {
-#ifdef NDEBUG
-    (void)is_mem_disabled;
-#endif
+                          bool is_mem_disabled __attribute__((__unused__)),
+                          uint64_t) override {
     // Always commit from the 2nd queue
     assert(!db_impl_->immutable_db_options().two_write_queues ||
            is_mem_disabled);
@@ -879,8 +908,8 @@ class WritePreparedRollbackPreReleaseCallback : public PreReleaseCallback {
     assert(prep_batch_cnt_ > 0);
   }
 
-  virtual Status Callback(SequenceNumber commit_seq,
-                          bool is_mem_disabled) override {
+  Status Callback(SequenceNumber commit_seq, bool is_mem_disabled,
+                  uint64_t) override {
     // Always commit from the 2nd queue
     assert(is_mem_disabled);  // implies the 2nd queue
     assert(db_impl_->immutable_db_options().two_write_queues);
@@ -939,6 +968,39 @@ struct SubBatchCounter : public WriteBatch::Handler {
   Status MarkRollback(const Slice&) override { return Status::OK(); }
   bool WriteAfterCommit() const override { return false; }
 };
+
+bool WritePreparedTxnDB::AssignMinMaxSeqs(const Snapshot* snapshot,
+                                          SequenceNumber* min,
+                                          SequenceNumber* max) {
+  if (snapshot != nullptr) {
+    *min = static_cast_with_check<const SnapshotImpl, const Snapshot>(snapshot)
+               ->min_uncommitted_;
+    *max = static_cast_with_check<const SnapshotImpl, const Snapshot>(snapshot)
+               ->number_;
+    return true;
+  } else {
+    *min = SmallestUnCommittedSeq();
+    *max = 0;  // to be assigned later after sv is referenced.
+    return false;
+  }
+}
+
+bool WritePreparedTxnDB::ValidateSnapshot(const SequenceNumber snap_seq,
+                                          const bool backed_by_snapshot,
+                                          std::memory_order order) {
+  if (backed_by_snapshot) {
+    return true;
+  } else {
+    SequenceNumber max = max_evicted_seq_.load(order);
+    // Validate that max has not advanced the snapshot seq that is not backed
+    // by a real snapshot. This is a very rare case that should not happen in
+    // real workloads.
+    if (UNLIKELY(snap_seq <= max && snap_seq != 0)) {
+      return false;
+    }
+  }
+  return true;
+}
 
 }  //  namespace rocksdb
 #endif  // ROCKSDB_LITE

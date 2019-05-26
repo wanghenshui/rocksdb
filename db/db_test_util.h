@@ -140,6 +140,11 @@ class SpecialMemTableRep : public MemTableRep {
     memtable_->Insert(handle);
   }
 
+  void InsertConcurrently(KeyHandle handle) override {
+    num_entries_++;
+    memtable_->Insert(handle);
+  }
+
   // Returns true iff an entry that compares equal to key is in the list.
   virtual bool Contains(const char* key) const override {
     return memtable_->Contains(key);
@@ -438,6 +443,12 @@ class SpecialEnv : public EnvWrapper {
         return s;
       }
 
+      virtual Status Prefetch(uint64_t offset, size_t n) override {
+        Status s = target_->Prefetch(offset, n);
+        *bytes_read_ += n;
+        return s;
+      }
+
      private:
       std::unique_ptr<RandomAccessFile> target_;
       anon::AtomicCounter* counter_;
@@ -682,6 +693,7 @@ class DBTestBase : public testing::Test {
     kPartitionedFilterWithNewTableReaderForCompactions,
     kUniversalSubcompactions,
     kxxHash64Checksum,
+    kUnorderedWrite,
     // This must be the last line
     kEnd,
   };
@@ -840,6 +852,9 @@ class DBTestBase : public testing::Test {
 
   std::vector<std::string> MultiGet(std::vector<int> cfs,
                                     const std::vector<std::string>& k,
+                                    const Snapshot* snapshot = nullptr);
+
+  std::vector<std::string> MultiGet(const std::vector<std::string>& k,
                                     const Snapshot* snapshot = nullptr);
 
   uint64_t GetNumSnapshots();

@@ -1,3 +1,4 @@
+// Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved.
 // Copyright (c) 2011 The LevelDB Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
@@ -94,6 +95,15 @@ class StackableDB : public DB {
       const std::vector<Slice>& keys,
       std::vector<std::string>* values) override {
     return db_->MultiGet(options, column_family, keys, values);
+  }
+
+  virtual void MultiGet(const ReadOptions& options,
+                        ColumnFamilyHandle* column_family,
+                        const size_t num_keys, const Slice* keys,
+                        PinnableSlice* values, Status* statuses,
+                        const bool sorted_input = false) override {
+    return db_->MultiGet(options, column_family, num_keys, keys,
+                         values, statuses, sorted_input);
   }
 
   using DB::IngestExternalFile;
@@ -280,6 +290,10 @@ class StackableDB : public DB {
   virtual Status SyncWAL() override { return db_->SyncWAL(); }
 
   virtual Status FlushWAL(bool sync) override { return db_->FlushWAL(sync); }
+
+  virtual Status LockWAL() override { return db_->LockWAL(); }
+
+  virtual Status UnlockWAL() override { return db_->UnlockWAL(); }
 
 #ifndef ROCKSDB_LITE
 

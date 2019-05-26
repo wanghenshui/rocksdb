@@ -265,16 +265,18 @@ void ForwardIterator::SVCleanup() {
   if (sv_ == nullptr) {
     return;
   }
+  bool background_purge =
+      read_options_.background_purge_on_iterator_cleanup ||
+      db_->immutable_db_options().avoid_unnecessary_blocking_io;
   if (pinned_iters_mgr_ && pinned_iters_mgr_->PinningEnabled()) {
     // pinned_iters_mgr_ tells us to make sure that all visited key-value slices
     // are alive until pinned_iters_mgr_->ReleasePinnedData() is called.
     // The slices may point into some memtables owned by sv_, so we need to keep
     // sv_ referenced until pinned_iters_mgr_ unpins everything.
-    auto p = new SVCleanupParams{
-      db_, sv_, read_options_.background_purge_on_iterator_cleanup};
+    auto p = new SVCleanupParams{db_, sv_, background_purge};
     pinned_iters_mgr_->PinPtr(p, &ForwardIterator::DeferredSVCleanup);
   } else {
-    SVCleanup(db_, sv_, read_options_.background_purge_on_iterator_cleanup);
+    SVCleanup(db_, sv_, background_purge);
   }
 }
 
@@ -379,9 +381,9 @@ void ForwardIterator::SeekInternal(const Slice& internal_key,
       }
     }
 
-    Slice user_key;
+    Slice target_user_key;
     if (!seek_to_first) {
-      user_key = ExtractUserKey(internal_key);
+      target_user_key = ExtractUserKey(internal_key);
     }
     const VersionStorageInfo* vstorage = sv_->current->storage_info();
     const std::vector<FileMetaData*>& l0 = vstorage->LevelFiles(0);
@@ -394,8 +396,8 @@ void ForwardIterator::SeekInternal(const Slice& internal_key,
       } else {
         // If the target key passes over the larget key, we are sure Next()
         // won't go over this file.
-        if (user_comparator_->Compare(user_key,
-              l0[i]->largest.user_key()) > 0) {
+        if (user_comparator_->Compare(target_user_key,
+                                      l0[i]->largest.user_key()) > 0) {
           if (read_options_.iterate_upper_bound != nullptr) {
             has_iter_trimmed_for_upper_bound_ = true;
             DeleteIterator(l0_iters_[i]);
